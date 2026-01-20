@@ -1,5 +1,5 @@
 {
-  "name": "cursor-2-claude-code",
+  "name": "cursor-2-claude-code-proxy",
   "version": "1.0.0",
   "main": "./src/index.ts",
   "scripts": {

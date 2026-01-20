@@ -50,27 +50,19 @@ const RESUME_NO_USER_MSG = "__RESUME_NO_USER_MSG__";
  * PATCH 1: User Message Creation Function
  * ============================================================================
  *
- * TARGET FUNCTION CHARACTERISTICS:
- * --------------------------------
+ * TARGET FUNCTION CHARACTERISTICS (based on stable string literals):
+ * ------------------------------------------------------------------
  * - Purpose: Converts user input (from stdin) into message objects for the API
- * - Location: Called when user submits input in CLI interactive mode
- * - Signature: Has 9 parameters, first param is the user input string/object
- * - Key behavior: Returns object with { messages, shouldQuery, maxThinkingTokens }
+ * - Key identifier: Contains string literal "tengu_input_prompt" (telemetry event name)
+ * - Returns: Object with { messages, shouldQuery: !0, maxThinkingTokens }
+ * - Note: This is the function that handles NORMAL user prompts (not slash commands)
  *
- * EXAMPLE (from v2.1.9, function name "Xm2"):
- * ```javascript
- * function Xm2(A, Q, B, G, Z, Y, J, X, I) {
- *   Z(!0);  // Callback to set loading state
- *   // ... processes user input A ...
- *   return { messages: [...], shouldQuery: !0, maxThinkingTokens: ... };
- * }
- * ```
- *
- * MATCHING STRATEGY:
- * 1. Find unique return pattern: `return { messages: [...], shouldQuery: !0, maxThinkingTokens:`
- * 2. Search backwards to find the function definition containing this return
- * 3. Extract parameter names dynamically from the function signature
- * 4. Insert our magic string check at the function start
+ * MATCHING STRATEGY (using ONLY stable string literals, not variable names):
+ * 1. Find the string literal "tengu_input_prompt" - this telemetry event name is stable
+ * 2. Distinguish from slash command handler by checking for "tengu_input_slash" nearby
+ * 3. Search backwards to find the containing function definition
+ * 4. Extract the first parameter name (user input) from function signature
+ * 5. Insert magic string check at function start
  *
  * PATCH EFFECT:
  * When input equals magic string, immediately return empty messages but
@@ -84,44 +76,89 @@ function applyPatch1(content: string): string {
     return content;
   }
 
-  // Find the return statement pattern: return { messages: X, shouldQuery: !0, maxThinkingTokens
-  // This is unique to the user message creation function
-  const returnPattern = /return\s*\{\s*messages:\s*\[([^\]]*)\],\s*shouldQuery:\s*!0,\s*maxThinkingTokens:/;
-  const returnMatch = content.match(returnPattern);
+  // Step 1: Find all occurrences of the string literal "tengu_input_prompt"
+  // This is the telemetry event name, which is stable across versions
+  // We search for the string itself, not the variable that calls it
+  const TELEMETRY_STRING = '"tengu_input_prompt"';
+  const telemetryIndices: number[] = [];
+  let searchStart = 0;
+  while (true) {
+    const idx = content.indexOf(TELEMETRY_STRING, searchStart);
+    if (idx === -1) break;
+    telemetryIndices.push(idx);
+    searchStart = idx + 1;
+  }
 
-  if (!returnMatch) {
-    console.error("ERROR: Could not find return { messages, shouldQuery } pattern.");
+  if (telemetryIndices.length === 0) {
+    console.error(`ERROR: Could not find string literal ${TELEMETRY_STRING}.`);
+    console.error("       The SDK structure may have changed significantly.");
     process.exit(1);
   }
 
-  // Find the function that contains this return statement
-  // Look backwards from the match position to find `function XXX(`
-  const returnIndex = content.indexOf(returnMatch[0]);
+  console.log(`    Found ${telemetryIndices.length} occurrences of ${TELEMETRY_STRING}`);
 
-  // Search backwards for `function XXX(` pattern
-  const beforeReturn = content.substring(0, returnIndex);
-  const funcMatches = [...beforeReturn.matchAll(/function\s+(\w+)\s*\(([^)]*)\)\s*\{/g)];
+  // Step 2: For each match, find the containing function
+  // We want the function that handles normal user prompts (not slash commands)
+  // The slash command handler has "tengu_input_slash" strings nearby
+  let targetFuncStart: string | null = null;
+  let targetFuncName: string | null = null;
+  let targetFirstParam: string | null = null;
 
-  if (funcMatches.length === 0) {
-    console.error("ERROR: Could not find function definition before return statement.");
+  for (const matchIndex of telemetryIndices) {
+    // Check if this is in the slash command context (has "tengu_input_slash" nearby)
+    const contextBefore = content.substring(Math.max(0, matchIndex - 500), matchIndex);
+    if (contextBefore.includes('"tengu_input_slash')) {
+      console.log(`    Skipping occurrence at ${matchIndex} (slash command context)`);
+      continue;
+    }
+
+    // Search backwards to find the function definition
+    const beforeMatch = content.substring(0, matchIndex);
+
+    // Find all function definitions before this point
+    // Pattern: function NAME(...) { or async function NAME(...) {
+    const funcDefPattern = /(async\s+)?function\s+([\w$]+)\s*\(([^)]*)\)\s*\{/g;
+    const funcMatches = [...beforeMatch.matchAll(funcDefPattern)];
+
+    if (funcMatches.length === 0) continue;
+
+    // Get the last (closest) function definition
+    const lastFunc = funcMatches[funcMatches.length - 1]!;
+
+    const funcName = lastFunc[2]!;
+    const params = lastFunc[3]!;
+
+    // Extract first parameter (user input)
+    const paramList = params.split(",").map((p) => p.trim().split("=")[0]!.trim());
+    if (paramList.length === 0 || !paramList[0]) continue;
+
+    const firstParam = paramList[0];
+
+    // Check that this function returns { messages:..., shouldQuery:!0, maxThinkingTokens:... }
+    // Search for the return pattern in a reasonable range after function start
+    const funcStartIndex = lastFunc.index!;
+    const searchRange = content.substring(funcStartIndex, funcStartIndex + 2000);
+    if (!searchRange.includes("shouldQuery:!0") || !searchRange.includes("maxThinkingTokens:")) {
+      console.log(`    Skipping function ${funcName} (no matching return pattern)`);
+      continue;
+    }
+
+    // Found the target function
+    targetFuncStart = lastFunc[0];
+    targetFuncName = funcName;
+    targetFirstParam = firstParam;
+    console.log(`    Found target function: ${funcName}(${firstParam},...)`);
+    break;
+  }
+
+  if (!targetFuncStart || !targetFuncName || !targetFirstParam) {
+    console.error("ERROR: Could not find user message function containing tengu_input_prompt.");
+    console.error("       The SDK structure may have changed significantly.");
     process.exit(1);
   }
 
-  // Get the last (closest) function definition
-  const lastFuncMatch = funcMatches[funcMatches.length - 1]!;
-  const funcName = lastFuncMatch[1];
-  const funcParams = lastFuncMatch[2]!;
-  const funcStart = lastFuncMatch[0];
-
-  // Extract parameter names
-  const params = funcParams.split(",").map((p) => p.trim());
-  const firstParam = params[0]; // First param is the user input
-  const fifthParam = params[4]; // Fifth param is typically the callback like Z(!0)
-
-  console.log(`    Found function: ${funcName}(${params.slice(0, 3).join(", ")}...)`);
-
-  // Build the patch - handle both string and array content formats
-  const replacePattern = `${funcStart}
+  // Step 3: Build the patch
+  const replacePattern = `${targetFuncStart}
   // ${PATCH_MARKER} - skip user message but continue query
   const RESUME_NO_USER_MSG = "${RESUME_NO_USER_MSG}";
   const _extractText = (input) => {
@@ -132,13 +169,12 @@ function applyPatch1(content: string): string {
     }
     return "";
   };
-  const _inputText = _extractText(${firstParam});
+  const _inputText = _extractText(${targetFirstParam});
   if (_inputText === RESUME_NO_USER_MSG || _inputText.trim() === RESUME_NO_USER_MSG) {
-    ${fifthParam}(!0);
     return { messages: [], shouldQuery: !0, maxThinkingTokens: void 0 };
   }`;
 
-  content = content.replace(funcStart, replacePattern);
+  content = content.replace(targetFuncStart, replacePattern);
   console.log("    Patch 1 (user message): Applied.");
   return content;
 }

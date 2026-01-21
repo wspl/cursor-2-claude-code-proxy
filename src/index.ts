@@ -1,3 +1,6 @@
+// Enable SDK debug logging - writes to ~/.claude/debug/sdk-*.txt
+process.env.DEBUG_CLAUDE_AGENT_SDK = "true";
+
 import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
 import { bearerAuth } from "hono/bearer-auth";

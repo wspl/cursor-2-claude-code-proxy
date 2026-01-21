@@ -410,8 +410,11 @@ function anthropicToInternal(request: AnthropicStyleRequest): InternalRequest {
 
   const { model: mappedModel, enableThinking } = mapModelName(request.model);
 
+  // Filter out problematic messages when thinking is enabled
+  const filteredMessages = filterMessagesWithoutThinking(messages, enableThinking, "anthropicToInternal");
+
   return {
-    messages,
+    messages: filteredMessages,
     ...(tools && { tools }),
     model: mappedModel,
     maxTokens: request.max_tokens || 4096,
@@ -420,6 +423,80 @@ function anthropicToInternal(request: AnthropicStyleRequest): InternalRequest {
     ...(request.temperature !== undefined && { temperature: request.temperature }),
     ...(enableThinking && { maxThinkingTokens: 10000 }),
   };
+}
+
+// ============================================================================
+// WORKAROUND: Cursor bug - drops native thinking blocks from assistant messages
+// ============================================================================
+//
+// When Cursor performs "context summarize", it calls Anthropic API directly via its own gateway,
+// receiving native thinking blocks with valid signatures. However, Cursor then DISCARDS these
+// thinking blocks when sending subsequent requests to our proxy, resulting in assistant messages
+// with only tool_use blocks and no thinking.
+//
+// Anthropic API requires ALL assistant messages to start with a thinking block when extended
+// thinking is enabled. Without this workaround, the API returns:
+//   "messages.X.content.0: If an assistant message contains any thinking blocks,
+//    the first block must be thinking or redacted_thinking. Found tool_use."
+//
+// Solution: Remove assistant messages that lack thinking blocks, along with their orphaned
+// tool_result responses. This loses some context but allows the conversation to continue.
+// ============================================================================
+
+function filterMessagesWithoutThinking(
+  messages: InternalMessage[],
+  enableThinking: boolean,
+  source: string
+): InternalMessage[] {
+  if (!enableThinking) {
+    return messages;
+  }
+
+  const removedToolIds = new Set<string>();
+
+  // First pass: find assistant messages without thinking and collect their tool_use IDs
+  let filtered = messages.filter((msg, idx) => {
+    if (msg.role === "assistant") {
+      const hasThinking = msg.content.some((b) => b.type === "thinking" || b.type === "redacted_thinking");
+      if (!hasThinking) {
+        msg.content.forEach((b) => {
+          if (b.type === "tool_use" && "id" in b) {
+            removedToolIds.add(b.id as string);
+          }
+        });
+        logger.warn(
+          `[Transform] ${source}: Removing assistant message[${idx}] without thinking block ` +
+          `(${msg.content.map((b) => b.type).join(", ")}). This is likely a Cursor bug that drops native thinking blocks.`
+        );
+        return false;
+      }
+    }
+    return true;
+  });
+
+  // Second pass: remove orphaned tool_result that reference removed tool_use
+  if (removedToolIds.size > 0) {
+    filtered = filtered.map((msg) => {
+      if (msg.role === "user") {
+        const filteredContent = msg.content.filter((b) => {
+          if (b.type === "tool_result" && "tool_use_id" in b) {
+            if (removedToolIds.has(b.tool_use_id as string)) {
+              logger.warn(`[Transform] Removing orphaned tool_result for tool_use_id: ${b.tool_use_id}`);
+              return false;
+            }
+          }
+          return true;
+        });
+        if (filteredContent.length === 0) {
+          return null;
+        }
+        return { ...msg, content: filteredContent };
+      }
+      return msg;
+    }).filter((msg): msg is InternalMessage => msg !== null);
+  }
+
+  return filtered;
 }
 
 // ============================================================================
@@ -499,8 +576,11 @@ function openaiToInternal(request: OpenAIStyleRequest): InternalRequest {
 
   const { model: mappedModel, enableThinking } = mapModelName(request.model);
 
+  // Filter out problematic messages when thinking is enabled
+  const filteredMessages = filterMessagesWithoutThinking(messages, enableThinking, "openaiToInternal");
+
   return {
-    messages,
+    messages: filteredMessages,
     ...(tools && { tools }),
     model: mappedModel,
     maxTokens: request.max_tokens || 4096,

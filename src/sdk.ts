@@ -19,6 +19,7 @@ import type {
   AnthropicTool,
 } from "./types";
 import { logger } from "./logger";
+import { config } from "./config";
 import { randomUUID } from "crypto";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
@@ -466,7 +467,7 @@ export async function processRequest(request: InternalRequest): Promise<SdkWrapp
     abortController,
     stderr: (message: string) => {
       if (config.debug) {
-        logger.debug(`[SDK] stderr: ${message}`);
+        logger.error(`[SDK] stderr: ${message}`);
       }
     },
     hooks: {

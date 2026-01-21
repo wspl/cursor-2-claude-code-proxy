@@ -16,6 +16,69 @@ export function calculateCrc32(text: string): string {
   return checksum.toString(16).padStart(8, "0");
 }
 
+// ============================================================================
+// Thinking Block Codec
+// ============================================================================
+
+/**
+ * Encode a thinking block to text format for OpenAI-style responses
+ *
+ * Format:
+ * ```thinking
+ * [Thinking]
+ * <escaped content>
+ * [SIG=<signature>,CRC=<crc>]
+ * ```
+ *
+ * All backticks in content are escaped to avoid streaming parsing issues
+ */
+export function encodeThinkingBlock(thinking: string, signature?: string): string {
+  // Escape all backticks to prevent streaming parsing issues
+  const escapedThinking = thinking.replace(/`/g, "\\`");
+
+  let sigTag = "";
+  if (signature) {
+    const crc = calculateCrc32(escapedThinking);
+    sigTag = `\n[SIG=${signature},CRC=${crc}]`;
+  }
+
+  return `\`\`\`thinking\n[Thinking]\n${escapedThinking}${sigTag}\n\`\`\`\n\n`;
+}
+
+/**
+ * Decode a thinking block from text format
+ * Returns null if the text doesn't match the expected format or CRC validation fails
+ */
+export function decodeThinkingBlock(text: string): { thinking: string; signature: string } | null {
+  const thinkingBlockRegex = /^```thinking\n\[Thinking\]\n([\s\S]*?)(?:\n\[SIG=([^,\]]+),CRC=([^\]]+)\])?\n```$/;
+  const match = thinkingBlockRegex.exec(text);
+
+  if (!match) {
+    return null;
+  }
+
+  const escapedContent = match[1]?.trim() || "";
+  const signature = match[2];
+  const crc = match[3];
+
+  if (!escapedContent || !signature || !crc) {
+    logger.debug(`[Transform] decodeThinkingBlock: missing content, signature, or crc`);
+    return null;
+  }
+
+  // Verify CRC (computed on escaped content)
+  const calculatedCrc = calculateCrc32(escapedContent);
+  if (calculatedCrc !== crc) {
+    logger.debug(`[Transform] decodeThinkingBlock: CRC mismatch - expected ${crc}, got ${calculatedCrc}`);
+    return null;
+  }
+
+  // Unescape all backticks
+  const thinking = escapedContent.replace(/\\`/g, "`");
+
+  return { thinking, signature };
+}
+
 interface ContentBlock {
   type: string;
   text?: string;
@@ -39,17 +102,12 @@ function extractTextContent(content: string | ContentBlock[] | null | undefined)
 
 /**
  * Parse text content and extract thinking blocks, converting them to proper content blocks
- *
- * Format:
- * ```thinking
- * [Thinking]
- * content
- * [SIG=<signature>,CRC=<crc>]
- * ```
+ * Uses decodeThinkingBlock for validation and decoding
  */
 function parseThinkingFromText(text: string): InternalContentBlock[] {
   const blocks: InternalContentBlock[] = [];
-  const thinkingBlockRegex = /```thinking\n\[Thinking\]\n([\s\S]*?)(?:\n\[SIG=([^,\]]+),CRC=([^\]]+)\])?\n```/g;
+  // Match the full thinking block pattern (same as encodeThinkingBlock output)
+  const thinkingBlockRegex = /```thinking\n\[Thinking\]\n[\s\S]*?(?:\n\[SIG=[^,\]]+,CRC=[^\]]+\])?\n```/g;
 
   let lastIndex = 0;
   let match: RegExpExecArray | null;
@@ -60,21 +118,12 @@ function parseThinkingFromText(text: string): InternalContentBlock[] {
       blocks.push({ type: "text", text: textBefore });
     }
 
-    const thinkingContent = match[1]?.trim() || "";
-    const signature = match[2] || undefined;
-    const crc = match[3] || undefined;
-
-    if (thinkingContent) {
-      if (signature && crc) {
-        const calculatedCrc = calculateCrc32(thinkingContent);
-        if (calculatedCrc === crc) {
-          blocks.push({ type: "thinking", thinking: thinkingContent, signature });
-        } else {
-          logger.debug(`[Transform] CRC mismatch: expected ${crc}, got ${calculatedCrc} - discarding thinking`);
-        }
-      } else {
-        logger.debug(`[Transform] No valid signature - discarding thinking`);
-      }
+    // Use decodeThinkingBlock for validation and decoding
+    const decoded = decodeThinkingBlock(match[0]);
+    if (decoded) {
+      blocks.push({ type: "thinking", thinking: decoded.thinking, signature: decoded.signature });
+    } else {
+      logger.debug(`[Transform] parseThinkingFromText: failed to decode thinking block`);
     }
 
     lastIndex = match.index + match[0].length;
@@ -325,7 +374,12 @@ function anthropicToInternal(request: AnthropicStyleRequest): InternalRequest {
             const parsedBlocks = parseThinkingFromText(block.text);
             content.push(...parsedBlocks);
           } else if (block.type === "thinking") {
-            continue; // Discard native thinking blocks
+            // Preserve native thinking blocks with signature for API verification
+            content.push({
+              type: "thinking",
+              thinking: block.thinking,
+              ...(block.signature && { signature: block.signature }),
+            });
           } else if (block.type === "tool_use") {
             content.push({
               type: "tool_use",
@@ -498,16 +552,10 @@ export function internalToOpenai(response: InternalResponse, requestModel: strin
         },
       });
     } else if (block.type === "thinking") {
-      const escapedThinking = block.thinking.replace(/```/g, "\\`\\`\\`");
-      let sigTag = "";
-      if (block.signature) {
-        const crc = calculateCrc32(escapedThinking);
-        sigTag = `\n[SIG=${block.signature},CRC=${crc}]`;
-      }
-      textContent.push(`\`\`\`thinking\n[Thinking]\n${escapedThinking}${sigTag}\n\`\`\`\n\n`);
+      textContent.push(encodeThinkingBlock(block.thinking, block.signature));
     } else if (block.type === "redacted_thinking") {
-      const escapedContent = block.data.replace(/```/g, "\\`\\`\\`");
-      textContent.push(`\`\`\`thinking\n[Thinking]\n${escapedContent}\n\`\`\`\n\n`);
+      // redacted_thinking doesn't have signature, encode without it
+      textContent.push(encodeThinkingBlock(block.data));
     }
   }
 

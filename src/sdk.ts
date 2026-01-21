@@ -464,6 +464,11 @@ export async function processRequest(request: InternalRequest): Promise<SdkWrapp
     ...(system && { systemPrompt: system }),
     ...(resumePath && { resume: resumePath }),
     abortController,
+    stderr: (message: string) => {
+      if (config.debug) {
+        logger.debug(`[SDK] stderr: ${message}`);
+      }
+    },
     hooks: {
       PreToolUse: [{
         matcher: "mcp__api-tools__*",

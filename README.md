@@ -61,7 +61,6 @@ This starts the proxy with a Cloudflare tunnel and outputs:
 ## Known Issues
 
 - Aborting a request may cause partial information loss (needs further debugging)
-- After Cursor performs context summarization, you need to send the continue command twice to proceed
 - Tool use with image responses may not work correctly
 
 ## License
